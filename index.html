@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>跳一跳</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #1a1a2e;
+    touch-action: none;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  canvas {
+    display: block;
+    width: 100%; height: 100%;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ═══════════════════════════════════════════════════════════════════
+//  跳一跳 — 仿微信小游戏（丝滑连跳版）
+//  操作：按住鼠标/触屏/空格键蓄力，松开跳跃
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── 常量 ─────────────────────────────────────────────────────────
+const BLOCK_DEPTH     = 22;
+const BLOCK_MIN_W     = 50;
+const BLOCK_MAX_W     = 90;
+const GAP_MIN         = 50;
+const GAP_MAX         = 200;
+const CHARGE_SPEED    = 0.003;
+const MAX_CHARGE      = 1.0;
+const CAMERA_LERP     = 0.07;
+const PERFECT_RATIO   = 0.12;
+const PLAYER_RADIUS   = 12;
+const PLAYER_HEIGHT   = 36;
+const LAND_FX_DUR     = 400;
+
+// ─── 跳跃物理（抛物线运动）────────────────────────────────────────
+const JUMP_GRAVITY    = 2500; // 像素/s²
+const JUMP_V0_MAX     = 1500; // 满蓄力初速度 像素/s
+const JUMP_ANGLE      = 55 * Math.PI / 180; // 发射角度
+const JUMP_DUR_MIN    = 0.2;  // 最短滞空时间 s
+const JUMP_DUR_FLOOR  = 0.15; // 最短时间系数（占满蓄力时长的比例）
+
+// ─── 颜色 ─────────────────────────────────────────────────────────
+const BLOCK_COLORS = [
+  { top: '#4ecdc4', left: '#3db8b0', right: '#2ea39c' },
+  { top: '#ff6b6b', left: '#e55a5a', right: '#cc4949' },
+  { top: '#ffd93d', left: '#e6c235', right: '#ccab2d' },
+  { top: '#6bcb77', left: '#5ab866', right: '#49a555' },
+  { top: '#4d96ff', left: '#3d82e6', right: '#2d6ecc' },
+  { top: '#ff922b', left: '#e67f25', right: '#cc6c1f' },
+  { top: '#cc5de8', left: '#b34dd0', right: '#993db8' },
+  { top: '#20c997', left: '#1ab383', right: '#149d6f' },
+  { top: '#f783ac', left: '#de7098', right: '#c55d84' },
+  { top: '#748ffc', left: '#6378e3', right: '#5261ca' },
+];
+
+// ─── Canvas ───────────────────────────────────────────────────────
+const canvas = document.getElementById('game');
+const ctx    = canvas.getContext('2d');
+let W, H;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width  = W * dpr;
+  canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// roundRect polyfill
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+  CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
+    if (typeof r === 'number') r = [r, r, r, r];
+    const [tl, tr, br, bl] = r;
+    this.moveTo(x + tl, y);
+    this.lineTo(x + w - tr, y);
+    this.quadraticCurveTo(x + w, y, x + w, y + tr);
+    this.lineTo(x + w, y + h - br);
+    this.quadraticCurveTo(x + w, y + h, x + w - br, y + h);
+    this.lineTo(x + bl, y + h);
+    this.quadraticCurveTo(x, y + h, x, y + h - bl);
+    this.lineTo(x, y + tl);
+    this.quadraticCurveTo(x, y, x + tl, y);
+    this.closePath();
+  };
+}
+
+// ─── 工具函数 ─────────────────────────────────────────────────────
+function rand(a, b) { return a + Math.random() * (b - a); }
+function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function easeOut(t) { return 1 - (1 - t) * (1 - t); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// 世界等轴坐标 → 屏幕坐标（不含相机偏移）
+function worldToScreen(isoX, isoY) {
+  return {
+    x: (isoX - isoY) * 0.7,
+    y: (isoX + isoY) * 0.4,
+  };
+}
+
+// ─── 方块 ─────────────────────────────────────────────────────────
+class Block {
+  constructor(isoX, isoY, w) {
+    this.isoX = isoX;
+    this.isoY = isoY;
+    this.w = w;
+    const c = BLOCK_COLORS[randInt(0, BLOCK_COLORS.length - 1)];
+    this.colorTop   = c.top;
+    this.colorLeft  = c.left;
+    this.colorRight = c.right;
+    this.flashAlpha = 0;
+  }
+
+  screenPos(camX, camY) {
+    const w = worldToScreen(this.isoX, this.isoY);
+    return { x: W / 2 + w.x - camX, y: H * 0.4 + w.y - camY };
+  }
+
+  draw(camX, camY) {
+    const { x, y } = this.screenPos(camX, camY);
+    const hw = this.w * 0.7;
+    const hh = this.w * 0.4;
+    const d  = BLOCK_DEPTH;
+
+    // 顶面
+    ctx.beginPath();
+    ctx.moveTo(x, y - hh);
+    ctx.lineTo(x + hw, y);
+    ctx.lineTo(x, y + hh);
+    ctx.lineTo(x - hw, y);
+    ctx.closePath();
+    ctx.fillStyle = this.colorTop;
+    ctx.fill();
+    if (this.flashAlpha > 0) {
+      ctx.fillStyle = `rgba(255,255,255,${this.flashAlpha})`;
+      ctx.fill();
+    }
+
+    // 左面
+    ctx.beginPath();
+    ctx.moveTo(x - hw, y);
+    ctx.lineTo(x, y + hh);
+    ctx.lineTo(x, y + hh + d);
+    ctx.lineTo(x - hw, y + d);
+    ctx.closePath();
+    ctx.fillStyle = this.colorLeft;
+    ctx.fill();
+
+    // 右面
+    ctx.beginPath();
+    ctx.moveTo(x + hw, y);
+    ctx.lineTo(x, y + hh);
+    ctx.lineTo(x, y + hh + d);
+    ctx.lineTo(x + hw, y + d);
+    ctx.closePath();
+    ctx.fillStyle = this.colorRight;
+    ctx.fill();
+  }
+
+  containsWorld(isoX, isoY) {
+    const dx = Math.abs(isoX - this.isoX);
+    const dy = Math.abs(isoY - this.isoY);
+    return dx + dy < this.w * 0.55;
+  }
+
+  isNearCenter(isoX, isoY) {
+    const dx = isoX - this.isoX;
+    const dy = isoY - this.isoY;
+    return Math.sqrt(dx * dx + dy * dy) < this.w * PERFECT_RATIO;
+  }
+}
+
+// ─── 游戏状态 ─────────────────────────────────────────────────────
+const STATE = { IDLE: 0, CHARGING: 1, JUMPING: 2, GAME_OVER: 3 };
+
+let state, blocks, currentIdx, nextDir;
+let charge, jumpStart, jumpDur, jumpPeakH;
+let score, bestScore, combo;
+let camX, camY, camTargetX, camTargetY;
+let particles, floats;
+let shakeTimer, shakeAmt;
+let showStart = true;
+
+// 角色实际世界坐标（连续追踪，不依赖方块中心）
+let charIsoX, charIsoY;
+
+// 指针状态追踪（自动连跳用）
+let ptrHeld = false;
+
+// 非阻塞落地特效
+let landFx;  // { time, isoX, isoY, onBlock, isPerfect, bounceH, ringSize, scoreDelta }
+
+function init() {
+  state     = STATE.IDLE;
+  blocks    = [];
+  particles = [];
+  floats    = [];
+  charge    = 0;
+  score     = 0;
+  combo     = 0;
+  shakeTimer = 0;
+  shakeAmt   = 0;
+  landFx     = null;
+  ptrHeld    = false;
+  bestScore  = parseInt(localStorage.getItem('jump_best') || '0');
+
+  // 起始方块
+  blocks.push(new Block(0, 0, 70));
+  currentIdx = 0;
+  charIsoX = 0;
+  charIsoY = 0;
+
+  // 下一个方向 & 生成
+  spawnNext();
+
+  // 相机归位
+  const w0 = worldToScreen(0, 0);
+  camX = camTargetX = w0.x;
+  camY = camTargetY = w0.y;
+}
+
+// ─── 生成下一个方块 ──────────────────────────────────────────────
+function spawnNext() {
+  const cur  = blocks[currentIdx];
+  // 加权随机：偏大间距，但分布更接近原版
+  const t = Math.pow(Math.random(), 0.75);
+  const gap = GAP_MIN + t * (GAP_MAX - GAP_MIN);
+  const w   = rand(BLOCK_MIN_W, BLOCK_MAX_W);
+  const dist = cur.w / 2 + gap + w / 2;
+  nextDir = Math.random() < 0.5 ? 'right' : 'left';
+  const nx = nextDir === 'right' ? cur.isoX + dist * 0.7 : cur.isoX;
+  const ny = nextDir === 'left'  ? cur.isoY + dist * 0.7 : cur.isoY;
+  blocks.push(new Block(nx, ny, w));
+}
+
+// ─── 跳跃物理计算 ────────────────────────────────────────────────
+// 蓄力 → 初速度
+function chargeToV0(chargeVal) { return JUMP_V0_MAX * chargeVal; }
+// 初速度 → 滞空时间（s）
+function calcJumpDur(chargeVal) {
+  const vUp = chargeToV0(chargeVal) * Math.sin(JUMP_ANGLE);
+  const maxDur = (2 * vUp) / JUMP_GRAVITY;
+  return Math.max(JUMP_DUR_MIN, Math.max(maxDur, JUMP_DUR_FLOOR * (2 * JUMP_V0_MAX * Math.sin(JUMP_ANGLE)) / JUMP_GRAVITY));
+}
+// 初速度 → 峰值高度（px）
+function calcJumpPeakH(chargeVal) {
+  const vUp = chargeToV0(chargeVal) * Math.sin(JUMP_ANGLE);
+  return (vUp * vUp) / (2 * JUMP_GRAVITY);
+}
+
+// 计算蓄力对应的落点（世界坐标）
+// 水平距离 = v₀·cos(θ)·T
+function calcLanding(chargeVal) {
+  const cur  = blocks[currentIdx];
+  const next = blocks[blocks.length - 1];
+  const dx = next.isoX - cur.isoX;
+  const dy = next.isoY - cur.isoY;
+  const len = Math.sqrt(dx * dx + dy * dy) || 1;
+
+  const v0   = chargeToV0(chargeVal);
+  const vh   = v0 * Math.cos(JUMP_ANGLE);
+  const dur  = calcJumpDur(chargeVal);
+  const hDist = vh * dur;
+
+  return {
+    isoX: cur.isoX + (dx / len) * hDist,
+    isoY: cur.isoY + (dy / len) * hDist,
+  };
+}
+
+// ─── 粒子 & 浮动文字 ─────────────────────────────────────────────
+function emitParticles(sx, sy, color, n) {
+  for (let i = 0; i < n; i++) {
+    particles.push({
+      x: sx, y: sy,
+      vx: rand(-3, 3), vy: rand(-5, -1),
+      life: 1, decay: rand(0.015, 0.04),
+      size: rand(2, 5), color,
+    });
+  }
+}
+
+function emitFloat(sx, sy, text, color) {
+  floats.push({ x: sx, y: sy, text, color, life: 1, vy: -1.5 });
+}
+
+// ─── 绘制 ─────────────────────────────────────────────────────────
+function drawBackground() {
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#16213e');
+  grad.addColorStop(0.5, '#1a1a2e');
+  grad.addColorStop(1, '#0f3460');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  const t = Date.now() * 0.001;
+  for (let i = 0; i < 30; i++) {
+    const sx = (Math.sin(i * 7.3 + 0.5) * 0.5 + 0.5) * W;
+    const sy = (Math.cos(i * 3.7 + 1.2) * 0.5 + 0.5) * H * 0.6;
+    const alpha = 0.3 + Math.sin(t * 2 + i) * 0.2;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 1 + (i % 3), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+    ctx.fill();
+  }
+}
+
+function drawPlayer(sx, sy, squish, rotation) {
+  const s = 1 - squish * 0.4;
+  const h = PLAYER_HEIGHT * s;
+  const r = PLAYER_RADIUS * (1 + squish * 0.3);
+
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  // 阴影
+  ctx.beginPath();
+  ctx.ellipse(0, 4, r * 1.2, r * 0.5, 0, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.fill();
+
+  ctx.save();
+  if (rotation) ctx.rotate(rotation);
+
+  const bodyGrad = ctx.createLinearGradient(-r, -h, r, 0);
+  bodyGrad.addColorStop(0, '#2d2d2d');
+  bodyGrad.addColorStop(0.5, '#404040');
+  bodyGrad.addColorStop(1, '#1a1a1a');
+
+  ctx.beginPath();
+  ctx.moveTo(-r, 0);
+  ctx.lineTo(-r, -h + r);
+  ctx.arc(0, -h + r, r, Math.PI, 0, false);
+  ctx.lineTo(r, 0);
+  ctx.arc(0, 0, r, 0, Math.PI, false);
+  ctx.closePath();
+  ctx.fillStyle = bodyGrad;
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(0, -h - 4, 6, 0, Math.PI * 2);
+  ctx.fillStyle = '#f0d9b5';
+  ctx.fill();
+
+  ctx.fillStyle = '#333';
+  ctx.beginPath();
+  ctx.arc(-2, -h - 5, 1.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(2, -h - 5, 1.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawChargeBar(v) {
+  const barW = 120, barH = 8;
+  const x = W / 2 - barW / 2;
+  const y = H - 60;
+  const ratio = clamp(v / MAX_CHARGE, 0, 1);
+  const hue = 120 - ratio * 120;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath();
+  ctx.roundRect(x - 2, y - 2, barW + 4, barH + 4, 6);
+  ctx.fill();
+
+  if (ratio > 0) {
+    ctx.fillStyle = `hsl(${hue}, 80%, 55%)`;
+    ctx.beginPath();
+    ctx.roundRect(x, y, barW * ratio, barH, 4);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 14px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText('蓄力中...', W / 2, y - 10);
+}
+
+function drawDirectionHint() {
+  if (state !== STATE.IDLE && state !== STATE.CHARGING) return;
+  const cur  = blocks[currentIdx];
+  const next = blocks[blocks.length - 1];
+  const cs = cur.screenPos(camX, camY);
+  const ns = next.screenPos(camX, camY);
+  const angle = Math.atan2(ns.y - cs.y, ns.x - cs.x);
+
+  ctx.save();
+  ctx.globalAlpha = 0.3 + Math.sin(Date.now() * 0.004) * 0.15;
+  ctx.setLineDash([6, 4]);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+
+  ctx.beginPath();
+  ctx.moveTo(cs.x, cs.y - 20);
+  const len = 40;
+  const ax = cs.x + Math.cos(angle) * len;
+  const ay = cs.y - 20 + Math.sin(angle) * len;
+  ctx.lineTo(ax, ay);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(ax, ay);
+  ctx.lineTo(ax - Math.cos(angle - 0.4) * 10, ay - Math.sin(angle - 0.4) * 10);
+  ctx.moveTo(ax, ay);
+  ctx.lineTo(ax - Math.cos(angle + 0.4) * 10, ay - Math.sin(angle + 0.4) * 10);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 36px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText(score, W / 2, 30);
+
+  if (combo > 1) {
+    ctx.font = 'bold 18px "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillStyle = '#ffd93d';
+    ctx.fillText(`连击 ×${combo}`, W / 2, 72);
+  }
+
+  ctx.font = '14px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(`最高: ${bestScore}`, 16, 24);
+}
+
+function drawStartScreen() {
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  ctx.fillStyle = '#4ecdc4';
+  ctx.font = 'bold 52px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.fillText('跳一跳', W / 2, H / 2 - 70);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.font = '18px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.fillText('按住蓄力，松开跳跃', W / 2, H / 2);
+  ctx.fillText('落在方块上得分，越接近中心分越高', W / 2, H / 2 + 30);
+
+  const alpha = 0.4 + Math.sin(Date.now() * 0.003) * 0.3;
+  ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+  ctx.font = '16px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.fillText('点击屏幕或按空格键开始', W / 2, H / 2 + 80);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  ctx.fillStyle = '#ff6b6b';
+  ctx.font = 'bold 48px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.fillText('游戏结束', W / 2, H / 2 - 90);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 72px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.fillText(score, W / 2, H / 2 - 15);
+
+  if (score >= bestScore && score > 0) {
+    ctx.fillStyle = '#ffd93d';
+    ctx.font = 'bold 20px "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('🎉 新纪录！', W / 2, H / 2 + 35);
+  } else {
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '18px "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText(`最高: ${bestScore}`, W / 2, H / 2 + 35);
+  }
+
+  const btnW = 180, btnH = 50;
+  const bx = W / 2 - btnW / 2, by = H / 2 + 70;
+  ctx.fillStyle = '#4ecdc4';
+  ctx.beginPath();
+  ctx.roundRect(bx, by, btnW, btnH, 25);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 20px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.fillText('再来一局', W / 2, by + btnH / 2);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.font = '13px "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.fillText('点击按钮或按空格键重新开始', W / 2, by + btnH + 25);
+  ctx.textBaseline = 'alphabetic';
+}
+
+// ─── 落地特效（非阻塞） ──────────────────────────────────────────
+function drawLandFx(ts) {
+  if (!landFx) return;
+
+  const elapsed = ts - landFx.time;
+  const t = clamp(elapsed / LAND_FX_DUR, 0, 1);
+
+  // 世界坐标 → 屏幕
+  const ws = worldToScreen(landFx.isoX, landFx.isoY);
+  const sx = W / 2 + ws.x - camX;
+  const sy = H * 0.4 + ws.y - camY;
+
+  // 冲击波环
+  if (landFx.onBlock) {
+    const ringR = lerp(0, 80, easeOut(t));
+    ctx.beginPath();
+    ctx.ellipse(sx, sy + 4, ringR, ringR * 0.55, 0, 0, Math.PI * 2);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = Math.max(0, 0.6 * (1 - t));
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // 落地标记圆
+    ctx.beginPath();
+    ctx.ellipse(sx, sy + 4, 10, 5.5, 0, 0, Math.PI * 2);
+    ctx.fillStyle = landFx.isPerfect
+      ? `rgba(255,217,61,${0.5 * (1 - t)})`
+      : `rgba(78,205,196,${0.5 * (1 - t)})`;
+    ctx.fill();
+  } else {
+    // 落空标记
+    ctx.beginPath();
+    ctx.ellipse(sx, sy + 4, 10, 5.5, 0, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,107,107,${0.5 * (1 - t)})`;
+    ctx.fill();
+  }
+
+  // 文字标注
+  const labelAlpha = Math.max(0, 1 - t * 1.2);
+  if (labelAlpha > 0.01) {
+    ctx.globalAlpha = labelAlpha;
+    ctx.font = 'bold 16px "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    if (landFx.onBlock) {
+      ctx.fillStyle = landFx.isPerfect ? '#ffd93d' : '#4ecdc4';
+      ctx.fillText(landFx.isPerfect ? '✓ 完美落地' : '✓ 落地成功', sx, sy - 55);
+    } else {
+      ctx.fillStyle = '#ff6b6b';
+      ctx.fillText('✗ 落空了', sx, sy - 55);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // 结束
+  if (t >= 1) landFx = null;
+}
+
+// ─── 游戏逻辑 ─────────────────────────────────────────────────────
+function startJump() {
+  if (state !== STATE.CHARGING || charge < 0.03) {
+    state = STATE.IDLE;
+    charge = 0;
+    return;
+  }
+  state = STATE.JUMPING;
+  jumpStart = performance.now();
+  jumpDur   = calcJumpDur(charge);      // 本次跳跃的滞空时间（秒）
+  jumpPeakH = calcJumpPeakH(charge);    // 本次跳跃的峰值高度（像素）
+
+  // 相机目标设为落点
+  const landing = calcLanding(charge);
+  const ls = worldToScreen(landing.isoX, landing.isoY);
+  camTargetX = ls.x;
+  camTargetY = ls.y;
+}
+
+function land() {
+  const landing = calcLanding(charge);
+  const target = blocks[blocks.length - 1]; // 目标方块（始终是数组最后一个）
+  const onBlock = target.containsWorld(landing.isoX, landing.isoY);
+  const isPerfect = onBlock && target.isNearCenter(landing.isoX, landing.isoY);
+
+  // 视觉效果
+  const ns = target.screenPos(camX, camY);
+  if (onBlock) {
+    if (isPerfect) {
+      combo++;
+      const bonus = combo * 2; // 2, 4, 6, 8, 10…
+      score += bonus;
+      emitFloat(ns.x, ns.y - 50, `+${bonus}`, '#ffd93d');
+      emitParticles(ns.x, ns.y, '#ffd93d', 18);
+      target.flashAlpha = 0.7;
+    } else {
+      combo = 0;
+      score += 1;
+      emitFloat(ns.x, ns.y - 50, '+1', '#fff');
+      emitParticles(ns.x, ns.y, target.colorTop, 8);
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      localStorage.setItem('jump_best', String(bestScore));
+    }
+  } else {
+    combo = 0;
+    shakeTimer = 300;
+    shakeAmt = 8;
+    const ws = worldToScreen(landing.isoX, landing.isoY);
+    emitParticles(W / 2 + ws.x - camX, H * 0.4 + ws.y - camY, '#ff6b6b', 25);
+  }
+
+  // 非阻塞落地特效
+  landFx = {
+    time: performance.now(),
+    isoX: landing.isoX,
+    isoY: landing.isoY,
+    onBlock,
+    isPerfect,
+  };
+
+  if (onBlock) {
+    // ★ 记录实际落点坐标（下次跳跃的起点）
+    charIsoX = landing.isoX;
+    charIsoY = landing.isoY;
+
+    // ★ 落地成功：立即切换方块 + 生成下一块（瞬间完成，无延迟）
+    currentIdx = blocks.length - 1;
+    const curBlock = blocks[currentIdx];
+    const ws = worldToScreen(curBlock.isoX, curBlock.isoY);
+    camTargetX = ws.x;
+    camTargetY = ws.y;
+
+    // 立即生成下一块（玩家 IDLE 时方向指示和蓄力阴影即刻可用）
+    spawnNext();
+
+    // 清理远处方块
+    if (blocks.length > 5) {
+      blocks.splice(0, blocks.length - 4);
+      currentIdx = blocks.length - 2;
+    }
+
+    // 立即可操作：仍按住 → 蓄力，否则 → IDLE
+    if (ptrHeld) {
+      state = STATE.CHARGING;
+      charge = 0;
+    } else {
+      state = STATE.IDLE;
+      charge = 0;
+    }
+  } else {
+    state = STATE.GAME_OVER;
+    charge = 0;
+  }
+}
+
+// ─── 主循环 ───────────────────────────────────────────────────────
+function update(ts) {
+  // 粒子
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.15;
+    p.life -= p.decay;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+  // 浮动文字
+  for (let i = floats.length - 1; i >= 0; i--) {
+    const f = floats[i];
+    f.y += f.vy; f.life -= 0.018;
+    if (f.life <= 0) floats.splice(i, 1);
+  }
+  // 闪光衰减
+  for (const b of blocks) {
+    if (b.flashAlpha > 0) b.flashAlpha = Math.max(0, b.flashAlpha - 0.025);
+  }
+  // 震屏衰减
+  if (shakeTimer > 0) shakeTimer -= 16;
+
+  // 相机平滑跟随
+  camX = lerp(camX, camTargetX, CAMERA_LERP);
+  camY = lerp(camY, camTargetY, CAMERA_LERP);
+
+  // 蓄力
+  if (state === STATE.CHARGING) {
+    charge = Math.min(charge + CHARGE_SPEED, MAX_CHARGE);
+  }
+
+  // 跳跃完成判定
+  if (state === STATE.JUMPING) {
+    const elapsed = (ts - jumpStart) / 1000; // 秒
+    const t = clamp(elapsed / jumpDur, 0, 1);
+    if (t >= 1) land();
+  }
+}
+
+function render(ts) {
+  ctx.save();
+
+  // 震屏
+  if (shakeTimer > 0) {
+    const s = shakeAmt * (shakeTimer / 300);
+    ctx.translate(rand(-s, s), rand(-s, s));
+  }
+
+  drawBackground();
+
+  // 方块
+  for (const b of blocks) b.draw(camX, camY);
+
+  drawDirectionHint();
+
+  // ─── 角色 & 蓄力阴影 ───
+  const cur = blocks[currentIdx];
+  if (state === STATE.IDLE || state === STATE.CHARGING) {
+    // 蓄力阴影预览
+    if (state === STATE.CHARGING && charge > 0.03) {
+      const landing = calcLanding(charge);
+      const ls = worldToScreen(landing.isoX, landing.isoY);
+      const shadowSx = W / 2 + ls.x - camX;
+      const shadowSy = H * 0.4 + ls.y - camY;
+      const next = blocks[blocks.length - 1];
+      const willLand = next.containsWorld(landing.isoX, landing.isoY);
+      const isPerf = willLand && next.isNearCenter(landing.isoX, landing.isoY);
+
+      ctx.globalAlpha = 0.35 + charge * 0.3;
+      const sr = 8 + charge * 6;
+      ctx.beginPath();
+      ctx.ellipse(shadowSx, shadowSy + 4, sr, sr * 0.55, 0, 0, Math.PI * 2);
+      ctx.fillStyle = isPerf ? '#ffd93d' : (willLand ? '#4ecdc4' : '#ff6b6b');
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.ellipse(shadowSx, shadowSy + 4, sr + 4, (sr + 4) * 0.55, 0, 0, Math.PI * 2);
+      ctx.strokeStyle = isPerf ? '#ffd93d' : (willLand ? '#4ecdc4' : '#ff6b6b');
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.2 + Math.sin(Date.now() * 0.008) * 0.15;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      ctx.font = 'bold 12px "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = isPerf ? '#ffd93d' : (willLand ? '#4ecdc4' : '#ff6b6b');
+      ctx.globalAlpha = 0.7;
+      ctx.fillText(isPerf ? '完美' : (willLand ? '可到达' : '太远'), shadowSx, shadowSy - 16);
+      ctx.globalAlpha = 1;
+    }
+
+    // 角色：始终画在 charIsoX/Y（上次落地的实际位置）
+    const cws = worldToScreen(charIsoX, charIsoY);
+    const charSx = W / 2 + cws.x - camX;
+    const charSy = H * 0.4 + cws.y - camY;
+    drawPlayer(charSx, charSy - 2, charge, 0);
+
+  } else if (state === STATE.JUMPING) {
+    const elapsed = (ts - jumpStart) / 1000; // 秒
+    const t = clamp(elapsed / jumpDur, 0, 1);
+    const eased = easeOut(t);
+
+    // 起点 = 上次落地的实际位置，不是方块中心
+    const fromS = worldToScreen(charIsoX, charIsoY);
+    const fromSx = W / 2 + fromS.x - camX;
+    const fromSy = H * 0.4 + fromS.y - camY;
+    const landing = calcLanding(charge);
+    const landS = worldToScreen(landing.isoX, landing.isoY);
+    const toSx = W / 2 + landS.x - camX;
+    const toSy = H * 0.4 + landS.y - camY;
+
+    const px = lerp(fromSx, toSx, eased);
+    // 非线性抛物线，峰值高度由物理公式计算
+    const arc = Math.pow(Math.sin(t * Math.PI), 0.7);
+    const py = lerp(fromSy, toSy, eased) - arc * jumpPeakH;
+
+    // 360° 旋转，起跳快转 → 顶部慢 → 落地前回正
+    const spin = Math.pow(t, 0.7) * Math.PI * 2;
+    drawPlayer(px, py, 0, spin);
+
+    // 轨迹
+    if (t < 0.85) {
+      ctx.globalAlpha = 0.3 * (1 - t);
+      ctx.beginPath();
+      ctx.arc(px, py + 2, 3, 0, Math.PI * 2);
+      ctx.fillStyle = '#fff';
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ─── 非阻塞落地特效（叠加在任何状态之上） ───
+  drawLandFx(ts);
+
+  // 粒子
+  for (const p of particles) {
+    ctx.globalAlpha = p.life;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // 浮动文字
+  for (const f of floats) {
+    ctx.globalAlpha = f.life;
+    ctx.fillStyle = f.color;
+    ctx.font = 'bold 24px "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // HUD
+  if (!showStart) {
+    drawHUD();
+    if (state === STATE.CHARGING) drawChargeBar(charge);
+  }
+
+  ctx.restore();
+
+  if (showStart) drawStartScreen();
+  else if (state === STATE.GAME_OVER) drawGameOver();
+}
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  update(ts);
+  render(ts);
+}
+
+// ─── 输入 ─────────────────────────────────────────────────────────
+function ptrDown(e) {
+  e.preventDefault();
+  ptrHeld = true;
+
+  if (showStart) { showStart = false; init(); return; }
+  if (state === STATE.GAME_OVER) { init(); return; }
+  if (state === STATE.IDLE) { state = STATE.CHARGING; charge = 0; }
+}
+
+function ptrUp(e) {
+  e.preventDefault();
+  ptrHeld = false;
+  if (state === STATE.CHARGING) startJump();
+}
+
+canvas.addEventListener('mousedown', ptrDown);
+canvas.addEventListener('mouseup', ptrUp);
+canvas.addEventListener('touchstart', ptrDown, { passive: false });
+canvas.addEventListener('touchend', ptrUp, { passive: false });
+
+document.addEventListener('keydown', e => {
+  if (e.code !== 'Space' || e.repeat) return;
+  e.preventDefault();
+  ptrHeld = true;
+  if (showStart) { showStart = false; init(); return; }
+  if (state === STATE.GAME_OVER) { init(); return; }
+  if (state === STATE.IDLE) { state = STATE.CHARGING; charge = 0; }
+});
+
+document.addEventListener('keyup', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  ptrHeld = false;
+  if (state === STATE.CHARGING) startJump();
+});
+
+// ─── 启动 ─────────────────────────────────────────────────────────
+init();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
